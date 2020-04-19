@@ -10,6 +10,8 @@ License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 */
 
+define('GIT_PUSH_CHECK_REFS', false);
+
 function git_push_admin_init() {
    wp_enqueue_style('fontawesome',
                     'https://use.fontawesome.com/releases/v5.8.1/css/all.css',
@@ -31,6 +33,30 @@ function git_push_admin_menu() {
 }
 
 add_action( 'admin_menu', 'git_push_admin_menu' );
+
+function git_push_get_push_user() {
+    return get_option("git_push_user", "");
+}
+
+function git_push_get_push_password() {
+    return get_option("git_push_pwd", "");
+}
+
+function git_push_get_push_url() {
+    return get_option("git_push_url", "");
+}
+
+function git_push_update_push_user($user) {
+    update_option("git_push_user", $user);
+}
+
+function git_push_update_push_password($pwd) {
+    update_option("git_push_pwd", $pwd);
+}
+
+function git_push_update_push_url($pwd) {
+    update_option("git_push_url", $pwd);
+}
 
 /*******************************************************************************
  WP2Static
@@ -62,6 +88,12 @@ function git_unpushed_commits($git_directory) {
     return array($git_output, $git_code);
 }
 
+function git_remotes($git_directory) {
+    exec('cd '.$git_directory.' && git remote',
+         $git_output, $git_code);
+    return array($git_output, $git_code);
+}
+
 function exec_command($cmd, $cwd) {
     $descriptorspec = array(
         0 => array("pipe", "r"),  // stdin
@@ -87,19 +119,26 @@ function exec_command($cmd, $cwd) {
         "code" => $code);
 }
 
-function git_push($git_directory) {
-    $git_push = exec_command('git push origin master', $git_directory);
+function git_push($git_directory, $git_user, $git_pwd, $git_url) {
+    $url = 'https://'.urlencode($git_user).':'.urlencode($git_pwd).'@'.$git_url;
+    $cmd = 'git push '.$url.' master';
+    
+    echo esc_html($cmd);
+    $git_push = exec_command($cmd, $git_directory);
     
     if ($git_push === false)
         return "proc_open('git push') failed";
 
     if ($git_push["code"] != 0)
         return $git_push["stderr"];
-        
+
     return null;
 }
 
-function git_commit_and_push($git_directory, $commit_msg, $commit_user, $commit_email, $commit_all) {
+function git_commit_and_push($git_directory, $commit_msg,
+        $commit_user, $commit_email, $commit_all,
+        $git_user, $git_pwd, $git_url) {
+
     if ($commit_all) {
         $git_add = exec_command('git add .', $git_directory);
 
@@ -123,7 +162,7 @@ function git_commit_and_push($git_directory, $commit_msg, $commit_user, $commit_
     if ($git_commit["code"] != 0)
         return $git_add["stderr"];
     
-    return git_push($git_directory);
+    return git_push($git_directory, $git_user, $git_pwd, $git_url);
 }
 
 function get_git_status_icon($s, $f = "") {
@@ -152,6 +191,32 @@ function get_git_status_icon($s, $f = "") {
  Process post
  ******************************************************************************/
 
+function process_post_push_options() {
+    $push_user = filter_input(INPUT_POST, "push_user");
+    if (!$push_user) {
+        render_commit_error("Name cannot be empty.");
+        return false;
+    }
+    
+    $push_pwd = filter_input(INPUT_POST, "push_pwd");
+    if (!$push_pwd) {
+        render_commit_error("Name cannot be empty.");
+        return false;
+    }
+    
+    $push_url = filter_input(INPUT_POST, "push_url");
+    if (!$push_url) {
+        render_commit_error("Remote repository cannot be empty.");
+        return false;
+    }
+    
+    git_push_update_push_user($push_user);
+    git_push_update_push_password($push_pwd);
+    git_push_update_push_url($push_url);
+    
+    return array($push_user, $push_pwd, $push_url);
+}
+
 function process_post_commit($git_directory) {
     $commit_message = filter_input(INPUT_POST, "commit_message");
     if (!$commit_message) {
@@ -176,8 +241,15 @@ function process_post_commit($git_directory) {
         $commit_all = false;
     }
     
+    $push_options = process_post_push_options();
+    if (!$push_options)
+        return false;
+    
+    list($git_user, $git_pwd, $git_url) = $push_options;
+    
     $commit_result = git_commit_and_push($git_directory, $commit_message,
-        $commit_user, $commit_email, $commit_all);
+        $commit_user, $commit_email, $commit_all,
+        $git_user, $git_pwd, $git_url);
     if (!is_null($commit_result)) {
         render_commit_error("Error committing and pushing: ".esc_html($commit_result));
         return false;
@@ -187,7 +259,13 @@ function process_post_commit($git_directory) {
 }
 
 function process_post_push($git_directory) {
-    $push_result = git_commitpush($git_directory);
+    $push_options = process_post_push_options();
+    if (!$push_options)
+        return false;
+    
+    list($git_user, $git_pwd, $git_url) = $push_options;
+
+    $push_result = git_push($git_directory, $git_user, $git_pwd, $git_url);
     if (!is_null($push_result)) {
         render_commit_error("Error pushing: ".esc_html($push_result));
         return false;
@@ -229,7 +307,72 @@ function render_nothing_to_commit() {
  Options page
  ******************************************************************************/
 
+function render_error($msg) {
+?>    
+        <table class="form-table" role="presentation">
+        <tr>
+            <th scope="row">Status</th>
+            <td><i class="fas fa-exclamation-circle"></i> <?php echo $msg; ?></td>
+        </tr>
+        </table>
+<?php
+}
+
+function render_error_git_failed($d, $code) {
+    render_error("Could not get the status of the Git repository in ".$d." (status code ".intval($code).").");
+}
+
+function render_push_options() {
+    /*
+?>
+        <tr>
+            <th scope="row"><label for="push_remote">Remote repository</label></th>
+            <td>
+                <select name="push_remote" id="push_remote">
+<?php
+    foreach ($git_remotes as $remote) {
+?>
+                    <option value="<?php echo $remote; ?>"><?php echo $remote; ?></option>
+<?php
+    }
+?>
+                </select>
+            </td>
+        </tr>
+<?php
+    */
+    
+    $push_user = git_push_get_push_user();
+    $push_pwd = git_push_get_push_password();
+    $push_url = git_push_get_push_url();
+?>
+        <tr>
+            <th scope="row"><label for="push_user">Name</label></th>
+            <td><input name="push_user" id="push_user" class="regular-text" type="text" value="<?php echo $push_user; ?>"></td>
+        </tr>
+        <tr>
+            <th scope="row"><label for="push_pwd">Password / token</label></th>
+            <td><input name="push_pwd" id="push_pwd" class="regular-text" type="text" value="<?php echo $push_pwd; ?>"></td>
+        </tr>
+        <tr>
+            <th scope="row"><label for="push_url">Remote repository URL</label></th>
+            <td>
+                <input name="push_url" id="push_url" class="regular-text" type="text" value="<?php echo $push_url; ?>">
+                <p class="description">Without the HTTPS. For example: github.com/myuser/myuser.github.io</strong></p>
+            </td>
+        </tr>
+<?php
+}
+
 function render_commit_status($git_status, $git_unpushed_count, $git_directory) {
+    /*
+    list($git_remotes, $git_remotes_code) = git_remotes($git_directory);
+    if ($git_remotes_code != 0) {
+        render_error("Could not get the remote repositories");
+        return;
+    }
+    */
+
     $git_commit_count = count($git_status);
 ?>
         <tr>
@@ -281,6 +424,9 @@ function render_commit_status($git_status, $git_unpushed_count, $git_directory) 
                 </fieldset>
             </td>
         </tr>
+<?php
+    render_push_options();
+?>
         <tr>
             <th scope="row">Publish</th>
             <td><input id="submit" class="button button-primary" type="submit" name="commit" value="Commit & Push"></td>
@@ -289,6 +435,11 @@ function render_commit_status($git_status, $git_unpushed_count, $git_directory) 
 }
 
 function render_push_status($git_unpushed_count, $git_directory) {
+    list($git_remotes, $git_remotes_code) = git_remotes($git_directory);
+    if ($git_remotes_code != 0) {
+        render_error("Could not get the remote repositories");
+        return;
+    }
 ?>
         <tr>
             <th scope="row">Status</th>
@@ -296,6 +447,9 @@ function render_push_status($git_unpushed_count, $git_directory) {
                 <p class="description"><?php echo $git_unpushed_count; ?> unpushed commits in <?php echo $git_directory; ?></p>
             </td>
         </tr>
+<?php
+    render_push_options();
+?>
         <tr>
             <th scope="row">Publish</th>
             <td><input id="submit" class="button button-primary" type="submit" name="push" value="Push"></td>
@@ -311,7 +465,10 @@ function render_git_status($git_directory) {
 
     if ($git_status_code == 0 && $git_unpushed_code == 0):
         $git_commit_count = count($git_status);
-        $git_unpushed_count = intval($git_unpushed[0]);
+        
+        $git_unpushed_count = 0;
+        if (GIT_PUSH_CHECK_REFS)
+            $git_unpushed_count = intval($git_unpushed[0]);
         
         if ($git_commit_count == 0 && $git_unpushed_count == 0) {
             render_nothing_to_commit();
@@ -336,29 +493,7 @@ function render_git_status($git_directory) {
     endif;
 }
 
-function render_error($msg) {
-?>    
-        <table class="form-table" role="presentation">
-        <tr>
-            <th scope="row">Status</th>
-            <td><i class="fas fa-exclamation-circle"></i> <?php echo $msg; ?></td>
-        </tr>
-        </table>
-<?php
-}
-
-function render_error_no_wp2static() {
-    render_error("WP2Static plugin not active.");
-}
-
-function render_error_wp2static_folder_mode() {
-    render_error("WP2Static plugin not in local subdirectory development mode.");
-}
-
-function render_error_git_failed($d, $code) {
-    render_error("Could not get the status of the Git repository in ".$d." (status code ".intval($code).").");
-}
-
+/* Wordpress admin page entry point */
 function git_push_page_contents() {
 ?>    
     <div class="wrap">
@@ -369,9 +504,9 @@ function git_push_page_contents() {
         if ($d)
             render_git_status($d);
         else
-            render_error_wp2static_folder_mode();
+            render_error("WP2Static plugin not in local subdirectory development mode.");
     } else {
-        render_error_no_wp2static();
+        render_error("WP2Static plugin not active.");
     }
 ?>
     </div>
